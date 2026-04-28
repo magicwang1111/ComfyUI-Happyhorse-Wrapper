@@ -1,0 +1,8 @@
+{
+  "api_key": "",
+  "endpoint": "https://dashscope.aliyuncs.com",
+  "poll_interval": 15,
+  "request_timeout": 60,
+  "upload_timeout": 120
+}
+
