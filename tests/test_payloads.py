@@ -7,6 +7,10 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(COMFY_ROOT))
 
 from py.nodes import (  # noqa: E402
+    _build_oss_object_name,
+    _normalize_oss_endpoint,
+    _parse_env_line,
+    _parse_oss_uri,
     _tensor_to_pil_images,
     build_image_to_video_payload,
     build_reference_to_video_payload,
@@ -73,3 +77,19 @@ def test_numpy_image_batch_to_pil():
     images = _tensor_to_pil_images(np.zeros((1, 4, 4, 3), dtype=np.float32))
     assert len(images) == 1
     assert images[0].size == (4, 4)
+
+
+def test_oss_uri_parsing_and_endpoint_normalization():
+    assert _parse_oss_uri("oss://goumee-coze/Happyhorse/") == ("goumee-coze", "Happyhorse/")
+    assert _normalize_oss_endpoint("oss-cn-hangzhou.aliyuncs.com") == "https://oss-cn-hangzhou.aliyuncs.com"
+
+
+def test_oss_object_name_keeps_prefix_and_filename():
+    object_name = _build_oss_object_name("Happyhorse", "first frame.png")
+    assert object_name.startswith("Happyhorse/")
+    assert object_name.endswith("_first%20frame.png")
+
+
+def test_env_line_parser_accepts_exports_and_quotes():
+    assert _parse_env_line('export OSS_BUCKET="goumee-coze"') == ("OSS_BUCKET", "goumee-coze")
+    assert _parse_env_line("# comment") is None

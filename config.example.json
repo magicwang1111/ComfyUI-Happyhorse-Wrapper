@@ -3,6 +3,8 @@
   "endpoint": "https://dashscope.aliyuncs.com",
   "poll_interval": 15,
   "request_timeout": 60,
-  "upload_timeout": 120
+  "upload_timeout": 120,
+  "oss_uri": "oss://your-bucket/Happyhorse/",
+  "oss_endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
+  "oss_url_expires": 86400
 }
-

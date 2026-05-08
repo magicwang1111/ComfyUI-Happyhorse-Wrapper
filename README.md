@@ -41,7 +41,31 @@ With the local AiHubMix endpoint tested during development, `happyhorse-1.0-t2v`
 
 ## Media Uploads
 
-HappyHorse media inputs require public HTTP/HTTPS URLs. The image nodes accept ComfyUI `IMAGE` tensors, save them as PNG files, upload them to `tmpfiles.org`, and send the resulting public URL to the API.
+HappyHorse media inputs require HTTP/HTTPS URLs. The image nodes accept ComfyUI `IMAGE` tensors, save them as PNG files, then upload them before calling the API.
+
+For reliable DashScope access, configure Alibaba Cloud OSS. The wrapper uploads media to OSS and sends a signed HTTPS URL to DashScope:
+
+Create `.env` in this plugin folder:
+
+```env
+OSS_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
+OSS_ACCESS_KEY_ID=your-access-key-id
+OSS_ACCESS_KEY_SECRET=your-access-key-secret
+OSS_BUCKET=your-bucket
+OSS_PREFIX=Happyhorse/
+```
+
+Or set the same values in your shell before starting ComfyUI:
+
+```powershell
+$env:OSS_ENDPOINT = "oss-cn-hangzhou.aliyuncs.com"
+$env:OSS_ACCESS_KEY_ID = "your-access-key-id"
+$env:OSS_ACCESS_KEY_SECRET = "your-access-key-secret"
+$env:OSS_BUCKET = "your-bucket"
+$env:OSS_PREFIX = "Happyhorse/"
+```
+
+You can also set `oss_uri` such as `oss://your-bucket/Happyhorse/` and `oss_endpoint` in `config.local.json`. Config values override environment variables and `.env`. If OSS is not configured, the wrapper falls back to `tmpfiles.org`, which may be unreachable from the model service even when it works from your browser.
 
 Generated video URLs expire, so connect generation nodes to `Preview Video` to save the MP4 under the ComfyUI output directory.
 

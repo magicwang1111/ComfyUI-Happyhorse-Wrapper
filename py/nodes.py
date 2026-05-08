@@ -2,12 +2,14 @@ import configparser
 from contextlib import contextmanager
 import io
 import json
+import mimetypes
 import os
 from pathlib import Path
 import sys
 import tempfile
 import time
 import urllib.parse
+import uuid
 
 import numpy
 from PIL import Image
@@ -29,6 +31,7 @@ NODE_CATEGORY = NODE_PREFIX
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 CONFIG_JSON_PATH = ROOT_DIR / "config.local.json"
+ENV_PATH = ROOT_DIR / ".env"
 LEGACY_CONFIG_PATH = ROOT_DIR / "config.ini"
 LEGACY_CONFIG_SECTION = "API"
 
@@ -36,6 +39,7 @@ DEFAULT_ENDPOINT = "https://dashscope.aliyuncs.com"
 DEFAULT_POLL_INTERVAL = 15.0
 DEFAULT_REQUEST_TIMEOUT = 60
 DEFAULT_UPLOAD_TIMEOUT = 120
+DEFAULT_OSS_URL_EXPIRES = 24 * 60 * 60
 DEFAULT_FILENAME_PREFIX = NODE_PREFIX
 
 TMPFILES_UPLOAD_API_URL = "https://tmpfiles.org/api/v1/upload"
@@ -48,6 +52,9 @@ RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"]
 DURATIONS = [str(value) for value in range(3, 16)]
 AUDIO_SETTINGS = ["auto", "origin"]
 SEED_MAX = 2147483647
+
+_ENV_FILE_CACHE = None
+_ENV_FILE_MTIME = None
 
 
 def _load_json_config():
@@ -72,9 +79,60 @@ def _present(data, key):
     return True
 
 
+def _strip_env_quotes(value):
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1]
+    return text
+
+
+def _parse_env_line(line):
+    text = str(line or "").lstrip("\ufeff").strip()
+    if not text or text.startswith("#"):
+        return None
+    if text.startswith("export "):
+        text = text[len("export "):].strip()
+    if "=" not in text:
+        return None
+    key, value = text.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None
+    return key, _strip_env_quotes(value)
+
+
+def _load_env_file():
+    global _ENV_FILE_CACHE, _ENV_FILE_MTIME
+
+    try:
+        mtime = ENV_PATH.stat().st_mtime
+    except OSError:
+        _ENV_FILE_CACHE = {}
+        _ENV_FILE_MTIME = None
+        return _ENV_FILE_CACHE
+
+    if _ENV_FILE_CACHE is not None and _ENV_FILE_MTIME == mtime:
+        return _ENV_FILE_CACHE
+
+    values = {}
+    with ENV_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            parsed = _parse_env_line(line)
+            if parsed:
+                key, value = parsed
+                values[key] = value
+    _ENV_FILE_CACHE = values
+    _ENV_FILE_MTIME = mtime
+    return values
+
+
 def _env_value(*keys):
+    env_file = _load_env_file()
     for key in keys:
         value = os.getenv(key, "").strip()
+        if value:
+            return value
+        value = str(env_file.get(key) or "").strip()
         if value:
             return value
     return ""
@@ -104,8 +162,70 @@ def _number(value, default, minimum=None, name="value"):
     return parsed
 
 
+def _normalize_oss_endpoint(endpoint):
+    value = str(endpoint or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"https://{value}"
+    return value.rstrip("/")
+
+
+def _parse_oss_uri(uri):
+    value = str(uri or "").strip()
+    if not value:
+        return "", ""
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme != "oss" or not parsed.netloc:
+        raise ValueError("oss_uri must look like oss://bucket/optional/prefix/.")
+    prefix = parsed.path.lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    return parsed.netloc, prefix
+
+
+def _normalize_oss_prefix(prefix):
+    value = str(prefix or "").strip().replace("\\", "/").lstrip("/")
+    while "//" in value:
+        value = value.replace("//", "/")
+    if value and not value.endswith("/"):
+        value += "/"
+    return value
+
+
+def _resolve_oss_location(data):
+    oss_uri = (
+        str(data["oss_uri"]).strip()
+        if _present(data, "oss_uri")
+        else _env_value("OSS_URI", "HAPPYHORSE_OSS_URI")
+    )
+    uri_bucket, uri_prefix = _parse_oss_uri(oss_uri) if oss_uri else ("", "")
+    bucket = (
+        str(data["oss_bucket"]).strip()
+        if _present(data, "oss_bucket")
+        else _env_value("OSS_BUCKET", "HAPPYHORSE_OSS_BUCKET")
+        or uri_bucket
+    )
+    if uri_bucket and bucket and bucket != uri_bucket:
+        raise ValueError("OSS bucket in oss_uri does not match oss_bucket/OSS_BUCKET.")
+    prefix = (
+        str(data["oss_prefix"]).strip()
+        if _present(data, "oss_prefix")
+        else _env_value("OSS_PREFIX", "HAPPYHORSE_OSS_PREFIX")
+        or uri_prefix
+    )
+    return bucket, _normalize_oss_prefix(prefix)
+
+
 def _resolve_config():
     data = _load_json_config()
+    oss_bucket, oss_prefix = _resolve_oss_location(data)
+    oss_url_expires = _number(
+        data.get("oss_url_expires") if _present(data, "oss_url_expires") else _env_value("OSS_URL_EXPIRES"),
+        DEFAULT_OSS_URL_EXPIRES,
+        60,
+        "oss_url_expires",
+    )
     api_key = (
         str(data["api_key"]).strip()
         if _present(data, "api_key")
@@ -128,6 +248,29 @@ def _resolve_config():
         "poll_interval": poll_interval,
         "request_timeout": request_timeout,
         "upload_timeout": upload_timeout,
+        "oss_endpoint": _normalize_oss_endpoint(
+            str(data["oss_endpoint"]).strip()
+            if _present(data, "oss_endpoint")
+            else _env_value("OSS_ENDPOINT", "HAPPYHORSE_OSS_ENDPOINT")
+        ),
+        "oss_access_key_id": (
+            str(data["oss_access_key_id"]).strip()
+            if _present(data, "oss_access_key_id")
+            else _env_value("OSS_ACCESS_KEY_ID", "ALIBABA_CLOUD_ACCESS_KEY_ID")
+        ),
+        "oss_access_key_secret": (
+            str(data["oss_access_key_secret"]).strip()
+            if _present(data, "oss_access_key_secret")
+            else _env_value("OSS_ACCESS_KEY_SECRET", "ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+        ),
+        "oss_security_token": (
+            str(data["oss_security_token"]).strip()
+            if _present(data, "oss_security_token")
+            else _env_value("OSS_SECURITY_TOKEN", "ALIBABA_CLOUD_SECURITY_TOKEN")
+        ),
+        "oss_bucket": oss_bucket,
+        "oss_prefix": oss_prefix,
+        "oss_url_expires": oss_url_expires,
     }
 
 
@@ -348,13 +491,74 @@ def _upload_file_to_tmpfiles(file_path, timeout=DEFAULT_UPLOAD_TIMEOUT):
     raise ConnectionError(f"Temporary media upload failed: {last_error}") from last_error
 
 
+def _require_oss2():
+    try:
+        import oss2
+    except ImportError as exc:
+        raise ImportError(
+            "OSS media upload requires the optional dependency 'oss2'. "
+            "Install requirements.txt in the ComfyUI Python environment."
+        ) from exc
+    return oss2
+
+
+def _build_oss_object_name(prefix, filename):
+    safe_filename = urllib.parse.quote(os.path.basename(filename), safe="._-")
+    return f"{_normalize_oss_prefix(prefix)}{time.strftime('%Y%m%d')}/{uuid.uuid4().hex}_{safe_filename}"
+
+
+def _upload_file_to_oss(file_path, config):
+    normalized_path = os.path.abspath(os.fspath(file_path))
+    if not os.path.exists(normalized_path):
+        raise ValueError(f"Upload file does not exist: {normalized_path}")
+
+    required = {
+        "OSS_ENDPOINT": config.get("oss_endpoint"),
+        "OSS_ACCESS_KEY_ID": config.get("oss_access_key_id"),
+        "OSS_ACCESS_KEY_SECRET": config.get("oss_access_key_secret"),
+        "OSS_BUCKET": config.get("oss_bucket"),
+    }
+    missing = [name for name, value in required.items() if not str(value or "").strip()]
+    if missing:
+        raise ValueError(f"OSS upload is enabled but missing required setting(s): {', '.join(missing)}.")
+
+    oss2 = _require_oss2()
+    auth = (
+        oss2.StsAuth(
+            config["oss_access_key_id"],
+            config["oss_access_key_secret"],
+            config["oss_security_token"],
+        )
+        if config.get("oss_security_token")
+        else oss2.Auth(config["oss_access_key_id"], config["oss_access_key_secret"])
+    )
+    bucket = oss2.Bucket(
+        auth,
+        config["oss_endpoint"],
+        config["oss_bucket"],
+        connect_timeout=float(config.get("upload_timeout") or DEFAULT_UPLOAD_TIMEOUT),
+    )
+
+    filename = os.path.basename(normalized_path)
+    object_name = _build_oss_object_name(config.get("oss_prefix"), filename)
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    bucket.put_object_from_file(object_name, normalized_path, headers={"Content-Type": content_type})
+    return bucket.sign_url("GET", object_name, int(config.get("oss_url_expires") or DEFAULT_OSS_URL_EXPIRES))
+
+
+def _upload_file(file_path, config):
+    if config.get("oss_bucket") or config.get("oss_endpoint"):
+        return _upload_file_to_oss(file_path, config)
+    return _upload_file_to_tmpfiles(file_path, timeout=config["upload_timeout"])
+
+
 def _upload_pil_image(image, index=0):
     config = _resolve_config()
     with tempfile.NamedTemporaryFile(prefix=f"happyhorse_{index}_", suffix=".png", delete=False) as handle:
         temp_path = handle.name
     try:
         image.save(temp_path, format="PNG")
-        return _upload_file_to_tmpfiles(temp_path, timeout=config["upload_timeout"])
+        return _upload_file(temp_path, config)
     finally:
         try:
             os.remove(temp_path)
